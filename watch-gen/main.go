@@ -20,12 +20,16 @@ import (
 const aFew = 32
 
 // source is the template we use to generate the source file.
-const source = `package memdb
+const source = `// Copyright IBM Corp. 2015, 2026
+// SPDX-License-Identifier: MPL-2.0
 
-//go:generate sh -c "go run watch-gen/main.go >watch_few.go"
+package memdb
+
+//go:generate sh -c "cd .. && go run ./watch-gen | gofmt >watch_few.go"
 
 import(
 	"context"
+	"time"
 )
 
 // aFew gives how many watchers this function is wired to support. You must
@@ -40,6 +44,24 @@ func watchFew(ctx context.Context, ch []<-chan struct{}) error {
 	case <-ch[{{printf "%d" $i}}]:
 		return nil
 {{end}}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// watchFewTimer is the timer-based counterpart of watchFew, used by Watch for
+// watch sets with at most aFew channels. Folding timeoutCh into the same
+// select lets Watch block in the caller's goroutine instead of spawning a
+// goroutine just to bridge the timer into a context. A nil timeoutCh blocks
+// forever, matching a receive on a nil channel.
+func watchFewTimer(ctx context.Context, ch []<-chan struct{}, timeoutCh <-chan time.Time) error {
+	select {
+{{range $i, $unused := .}}
+	case <-ch[{{printf "%d" $i}}]:
+		return nil
+{{end}}
+	case <-timeoutCh:
+		return context.Canceled
 	case <-ctx.Done():
 		return ctx.Err()
 	}
