@@ -13,6 +13,25 @@ import (
 	"github.com/hashicorp/go-immutable-radix"
 )
 
+// commitView is the atomically published result of a single commit. The
+// pointer to it is swapped in one atomic store, so a reader that loads the
+// view always observes the data root, the generation number and the change
+// log of exactly one commit — never a mix of generations.
+type commitView struct {
+	// generation is a monotonically increasing identifier of the commit.
+	// It is 0 for a freshly initialized (empty) database.
+	generation uint64
+
+	// root is the root of the immutable radix trees holding all table
+	// indexes (the data) as of this generation.
+	root *iradix.Tree
+
+	// changes is the de-duplicated, commit-ordered change log entry for
+	// this generation. It is nil for generations that did not track
+	// changes and for the initial empty generation.
+	changes Changes
+}
+
 // MemDB is an in-memory database providing Atomicity, Consistency, and
 // Isolation from ACID. MemDB doesn't provide Durability since it is an
 // in-memory database.
@@ -28,11 +47,16 @@ import (
 // snapshots of the DB being read from other goroutines.
 type MemDB struct {
 	schema  *DBSchema
-	root    unsafe.Pointer // *iradix.Tree underneath
+	view    unsafe.Pointer // *commitView underneath
 	primary bool
 
 	// There can only be a single writer at once
 	writer sync.Mutex
+
+	// subs tracks the live commit subscribers. Registration, removal and
+	// broadcast are serialized by its mutex; broadcasting never blocks a
+	// commit because delivery to each subscriber is non-blocking.
+	subs *subscriberRegistry
 }
 
 // NewMemDB creates a new MemDB with the given schema.
@@ -45,8 +69,9 @@ func NewMemDB(schema *DBSchema) (*MemDB, error) {
 	// Create the MemDB
 	db := &MemDB{
 		schema:  schema,
-		root:    unsafe.Pointer(iradix.New()),
+		view:    unsafe.Pointer(&commitView{root: iradix.New()}),
 		primary: true,
+		subs:    newSubscriberRegistry(),
 	}
 	if err := db.initialize(); err != nil {
 		return nil, err
@@ -63,10 +88,41 @@ func (db *MemDB) DBSchema() *DBSchema {
 	return db.schema
 }
 
+// getView is used to do an atomic load of the committed view. The returned
+// view ties the data root, the generation and the change log of a single
+// commit together.
+func (db *MemDB) getView() *commitView {
+	return (*commitView)(atomic.LoadPointer(&db.view))
+}
+
+// setView atomically publishes a new committed view. Committing
+// transactions must go through subscriberRegistry.publish so that the
+// view swap and the subscriber broadcast stay atomic with respect to
+// concurrent Subscribe calls.
+func (db *MemDB) setView(view *commitView) {
+	atomic.StorePointer(&db.view, unsafe.Pointer(view))
+}
+
 // getRoot is used to do an atomic load of the root pointer
 func (db *MemDB) getRoot() *iradix.Tree {
-	root := (*iradix.Tree)(atomic.LoadPointer(&db.root))
-	return root
+	return db.getView().root
+}
+
+// Generation returns the generation of the latest commit. It is 0 before
+// any write transaction has committed. Every successful commit publishes
+// its data, change log and watch notifications under a new, strictly
+// increasing generation.
+func (db *MemDB) Generation() uint64 {
+	return db.getView().generation
+}
+
+// CommittedChanges returns the change log entry of the latest commit, or
+// nil if the latest commit did not track changes. The returned slice is
+// exactly the set of mutations that transitioned the database from
+// Generation()-1 to Generation(), de-duplicated per object and in
+// commit order.
+func (db *MemDB) CommittedChanges() Changes {
+	return db.getView().changes
 }
 
 // Txn is used to start a new transaction in either read or write mode.
@@ -92,10 +148,24 @@ func (db *MemDB) Txn(write bool) *Txn {
 func (db *MemDB) Snapshot() *MemDB {
 	clone := &MemDB{
 		schema:  db.schema,
-		root:    unsafe.Pointer(db.getRoot()),
+		view:    unsafe.Pointer(db.getView()),
 		primary: false,
+		subs:    newSubscriberRegistry(),
 	}
 	return clone
+}
+
+// Close shuts down the database's notification machinery: every registered
+// subscriber channel is closed and future Subscribe calls fail. It is safe
+// to call Close concurrently with commits, subscriptions and
+// unsubscriptions; it never blocks on slow subscribers. In-flight and future
+// transactions are unaffected — reads and writes still work — but no further
+// commit notifications are delivered.
+func (db *MemDB) Close() error {
+	if db.subs != nil {
+		db.subs.close()
+	}
+	return nil
 }
 
 // initialize is used to setup the DB for use after creation. This should
@@ -109,7 +179,7 @@ func (db *MemDB) initialize() error {
 			root, _, _ = root.Insert(path, index)
 		}
 	}
-	db.root = unsafe.Pointer(root)
+	db.view = unsafe.Pointer(&commitView{root: root})
 	return nil
 }
 

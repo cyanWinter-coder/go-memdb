@@ -7,8 +7,6 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
-	"sync/atomic"
-	"unsafe"
 
 	iradix "github.com/hashicorp/go-immutable-radix"
 )
@@ -148,13 +146,32 @@ func (txn *Txn) Commit() {
 		txn.rootTxn.Insert(path, final)
 	}
 
-	// Update the root of the DB
-	newRoot := txn.rootTxn.CommitOnly()
-	atomic.StorePointer(&txn.db.root, unsafe.Pointer(newRoot))
+	// Finalize the change log for this commit before publishing so the
+	// view carries the de-duplicated, commit-ordered changes.
+	var changes Changes
+	if txn.changes != nil {
+		changes = txn.Changes()
+	}
+
+	// Build the next generation's view: data, indexes and change log of
+	// this commit become visible together in a single atomic publication.
+	prev := txn.db.getView()
+	newView := &commitView{
+		generation: prev.generation + 1,
+		root:       txn.rootTxn.CommitOnly(),
+		changes:    changes,
+	}
+
+	// Publish the view and broadcast the commit event to subscribers.
+	// This is atomic with respect to Subscribe: a concurrent subscriber
+	// either starts from the previous generation and receives this
+	// event, or starts from the new generation's snapshot.
+	event := CommitEvent{Generation: newView.generation, Changes: changes}
+	txn.db.subs.publish(txn.db, newView, event)
 
 	// Now issue all of the mutation updates (this is safe to call
 	// even if mutation tracking isn't enabled); we do this after
-	// the root pointer is swapped so that waking responders will
+	// the view is swapped so that waking responders will
 	// see the new state.
 	for _, subTxn := range txn.modified {
 		subTxn.Notify()
