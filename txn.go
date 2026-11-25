@@ -5,6 +5,7 @@ package memdb
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -15,6 +16,11 @@ import (
 
 const (
 	id = "id"
+
+	// deleteBatchSize bounds the number of objects buffered while deleting an
+	// iterator result. Deleting in bounded batches avoids retaining every
+	// object from a large result set for the duration of the operation.
+	deleteBatchSize = 1024
 )
 
 var (
@@ -196,7 +202,7 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 	idIndexer := idSchema.Indexer.(SingleIndexer)
 	ok, idVal, err := idIndexer.FromObject(obj)
 	if err != nil {
-		return fmt.Errorf("failed to build primary index: %v", err)
+		return fmt.Errorf("failed to build primary index: %w", err)
 	}
 	if !ok {
 		return fmt.Errorf("object missing primary index")
@@ -227,7 +233,7 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 			ok, vals, err = indexer.FromObject(obj)
 		}
 		if err != nil {
-			return fmt.Errorf("failed to build index '%s': %v", name, err)
+			return fmt.Errorf("failed to build index '%s': %w", name, err)
 		}
 
 		// Handle non-unique index by computing a unique index.
@@ -255,7 +261,7 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 				okExist, valsExist, err = indexer.FromObject(existing)
 			}
 			if err != nil {
-				return fmt.Errorf("failed to build index '%s': %v", name, err)
+				return fmt.Errorf("failed to build index '%s': %w", name, err)
 			}
 			if okExist {
 				for i, valExist := range valsExist {
@@ -304,6 +310,10 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 
 // Delete is used to delete a single object from the given table.
 // This object must already exist in the table.
+//
+// ErrNotFound is returned if the primary index does not contain the object.
+// The error is returned before any index for the call is mutated, so the
+// transaction remains usable and can be committed with other changes.
 func (txn *Txn) Delete(table string, obj interface{}) error {
 	if !txn.write {
 		return fmt.Errorf("cannot delete in read-only transaction")
@@ -320,7 +330,7 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 	idIndexer := idSchema.Indexer.(SingleIndexer)
 	ok, idVal, err := idIndexer.FromObject(obj)
 	if err != nil {
-		return fmt.Errorf("failed to build primary index: %v", err)
+		return fmt.Errorf("failed to build primary index: %w", err)
 	}
 	if !ok {
 		return fmt.Errorf("object missing primary index")
@@ -333,188 +343,207 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 		return ErrNotFound
 	}
 
-	// Remove the object from all the indexes
-	for name, indexSchema := range tableSchema.Indexes {
-		indexTxn := txn.writableIndex(table, name)
+	if err := txn.deleteObjectFromAllIndexes(table, tableSchema, idVal, existing); err != nil {
+		return err
+	}
+	txn.appendDeleteChange(table, idVal, existing)
+	return nil
+}
 
-		// Handle the update by deleting from the index first
-		var (
-			ok   bool
-			vals [][]byte
-			err  error
-		)
-		switch indexer := indexSchema.Indexer.(type) {
-		case SingleIndexer:
-			var val []byte
-			ok, val, err = indexer.FromObject(existing)
-			vals = [][]byte{val}
-		case MultiIndexer:
-			ok, vals, err = indexer.FromObject(existing)
-		}
+// indexDelete is a precomputed set of keys to remove from one index.
+type indexDelete struct {
+	index string
+	keys  [][]byte
+}
+
+// deleteObjectFromAllIndexes removes an existing object from every index in
+// its table. All keys are computed before any index is mutated so that a
+// failing indexer cannot leave this object half-deleted.
+func (txn *Txn) deleteObjectFromAllIndexes(
+	table string,
+	tableSchema *TableSchema,
+	idVal []byte,
+	existing interface{},
+) error {
+	plans := make([]indexDelete, 0, len(tableSchema.Indexes))
+	for name, indexSchema := range tableSchema.Indexes {
+		keys, err := deletionIndexKeys(indexSchema, existing, idVal)
 		if err != nil {
-			return fmt.Errorf("failed to build index '%s': %v", name, err)
+			return fmt.Errorf("failed to build index '%s': %w", name, err)
 		}
-		if ok {
-			// Handle non-unique index by computing a unique index.
-			// This is done by appending the primary key which must
-			// be unique anyways.
-			for _, val := range vals {
-				if !indexSchema.Unique {
-					val = append(val, idVal...)
-				}
-				indexTxn.Delete(val)
-			}
+		if len(keys) > 0 {
+			plans = append(plans, indexDelete{index: name, keys: keys})
 		}
 	}
-	if txn.changes != nil {
-		txn.changes = append(txn.changes, Change{
-			Table:      table,
-			Before:     existing,
-			After:      nil, // Now nil indicates deletion
-			primaryKey: idVal,
-		})
+
+	for _, plan := range plans {
+		indexTxn := txn.writableIndex(table, plan.index)
+		for _, key := range plan.keys {
+			indexTxn.Delete(key)
+		}
 	}
 	return nil
 }
 
+// deletionIndexKeys builds the complete set of stored keys for existing in
+// indexSchema, including the primary-key suffix used by non-unique indexes.
+func deletionIndexKeys(indexSchema *IndexSchema, existing interface{}, idVal []byte) ([][]byte, error) {
+	var (
+		ok   bool
+		vals [][]byte
+		err  error
+	)
+	switch indexer := indexSchema.Indexer.(type) {
+	case SingleIndexer:
+		var val []byte
+		ok, val, err = indexer.FromObject(existing)
+		vals = [][]byte{val}
+	case MultiIndexer:
+		ok, vals, err = indexer.FromObject(existing)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
+	}
+
+	keys := make([][]byte, 0, len(vals))
+	for _, val := range vals {
+		if !indexSchema.Unique {
+			// Copy before appending so a spare-capacity slice returned by an
+			// indexer cannot alias another key for the same object.
+			key := make([]byte, 0, len(val)+len(idVal))
+			key = append(key, val...)
+			key = append(key, idVal...)
+			val = key
+		}
+		keys = append(keys, val)
+	}
+	return keys, nil
+}
+
+func (txn *Txn) appendDeleteChange(table string, idVal []byte, existing interface{}) {
+	if txn.changes == nil {
+		return
+	}
+	txn.changes = append(txn.changes, Change{
+		Table:      table,
+		Before:     existing,
+		After:      nil, // Now nil indicates deletion
+		primaryKey: idVal,
+	})
+}
+
 // DeletePrefix is used to delete an entire subtree based on a prefix.
-// The given index must be a prefix index, and will be used to perform a scan and enumerate the set of objects to delete.
-// These will be removed from all other indexes, and then a special prefix operation will delete the objects from the given index in an efficient subtree delete operation.
-// This is useful when you have a very large number of objects indexed by the given index, along with a much smaller number of entries in the other indexes for those objects.
-func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (bool, error) {
+// The given index must be a prefix index, and will be used to perform a scan and
+// enumerate the set of objects to delete. Each matched object is then removed
+// from every index, including any additional values it has in the prefixed
+// index that do not themselves match the prefix.
+//
+// It returns the number of distinct objects deleted. Deleting a prefix that
+// matches no objects returns zero and no error; calling it repeatedly has the
+// same stable result.
+func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (int, error) {
 	if !txn.write {
-		return false, fmt.Errorf("cannot delete in read-only transaction")
+		return 0, fmt.Errorf("cannot delete in read-only transaction")
 	}
 
 	if !strings.HasSuffix(prefix_index, "_prefix") {
-		return false, fmt.Errorf("Index name for DeletePrefix must be a prefix index, Got %v ", prefix_index)
+		return 0, fmt.Errorf("Index name for DeletePrefix must be a prefix index, Got %v ", prefix_index)
 	}
 
-	deletePrefixIndex := strings.TrimSuffix(prefix_index, "_prefix")
+	targetIndex := strings.TrimSuffix(prefix_index, "_prefix")
 
-	// Get an iterator over all of the keys with the given prefix.
-	entries, err := txn.Get(table, prefix_index, prefix)
+	// Get an iterator over all of the keys with the given prefix. Keep the
+	// encoded prefix value so the final radix prefix delete uses the same
+	// lower-cased/encoded key as the scan.
+	entries, prefixKey, err := txn.getResultIteratorWithValue(table, prefix_index, prefix)
 	if err != nil {
-		return false, fmt.Errorf("failed kvs lookup: %s", err)
-	}
-	// Get the table schema
-	tableSchema, ok := txn.db.schema.Tables[table]
-	if !ok {
-		return false, fmt.Errorf("invalid table '%s'", table)
+		return 0, fmt.Errorf("failed kvs lookup: %w", err)
 	}
 
-	foundAny := false
-	for entry := entries.Next(); entry != nil; entry = entries.Next() {
-		if !foundAny {
-			foundAny = true
-		}
-		// Get the primary ID of the object
-		idSchema := tableSchema.Indexes[id]
-		idIndexer := idSchema.Indexer.(SingleIndexer)
-		ok, idVal, err := idIndexer.FromObject(entry)
-		if err != nil {
-			return false, fmt.Errorf("failed to build primary index: %v", err)
-		}
-		if !ok {
-			return false, fmt.Errorf("object missing primary index")
-		}
-		if txn.changes != nil {
-			// Record the deletion
-			idTxn := txn.writableIndex(table, id)
-			existing, ok := idTxn.Get(idVal)
-			if ok {
-				txn.changes = append(txn.changes, Change{
-					Table:      table,
-					Before:     existing,
-					After:      nil, // Now nil indicates deletion
-					primaryKey: idVal,
-				})
-			}
-		}
-		// Remove the object from all the indexes except the given prefix index
-		for name, indexSchema := range tableSchema.Indexes {
-			if name == deletePrefixIndex {
-				continue
-			}
-			indexTxn := txn.writableIndex(table, name)
-
-			// Handle the update by deleting from the index first
-			var (
-				ok   bool
-				vals [][]byte
-				err  error
-			)
-			switch indexer := indexSchema.Indexer.(type) {
-			case SingleIndexer:
-				var val []byte
-				ok, val, err = indexer.FromObject(entry)
-				vals = [][]byte{val}
-			case MultiIndexer:
-				ok, vals, err = indexer.FromObject(entry)
-			}
-			if err != nil {
-				return false, fmt.Errorf("failed to build index '%s': %v", name, err)
-			}
-
-			if ok {
-				// Handle non-unique index by computing a unique index.
-				// This is done by appending the primary key which must
-				// be unique anyways.
-				for _, val := range vals {
-					if !indexSchema.Unique {
-						val = append(val, idVal...)
-					}
-					indexTxn.Delete(val)
-				}
-			}
-		}
-
+	deleted, err := txn.deleteFromResultIterator(table, entries)
+	if err != nil {
+		return deleted, err
 	}
-	if foundAny {
-		indexTxn := txn.writableIndex(table, deletePrefixIndex)
-		ok = indexTxn.DeletePrefix([]byte(prefix))
-		if !ok {
-			panic(fmt.Errorf("prefix %v matched some entries but DeletePrefix did not delete any ", prefix))
+
+	// The per-object deletes remove every index entry belonging to matched
+	// objects. The subtree delete efficiently removes any remaining matched
+	// keys, such as orphaned entries whose primary object was already absent.
+	indexTxn := txn.writableIndex(table, targetIndex)
+	indexTxn.DeletePrefix(prefixKey)
+
+	return deleted, nil
+}
+
+// deleteFromResultIterator deletes objects from iter in bounded batches.
+//
+// A result can contain the same object more than once when a multi-index has
+// several matching values. After the first successful Delete, later copies
+// return ErrNotFound and are ignored so the returned count counts objects and
+// repeated/bulk deletion remains idempotent.
+func (txn *Txn) deleteFromResultIterator(table string, iter ResultIterator) (int, error) {
+	deleted := 0
+	batch := make([]interface{}, 0, deleteBatchSize)
+
+	flush := func() error {
+		for i, obj := range batch {
+			err := txn.Delete(table, obj)
+			// Release the object reference as soon as this batch entry is
+			// processed; the batch slice itself is reused only briefly.
+			batch[i] = nil
+			switch {
+			case err == nil:
+				deleted++
+			case errors.Is(err, ErrNotFound):
+				// The object was already removed, usually by an earlier
+				// matching index entry in this same result.
+			default:
+				return err
+			}
 		}
-		return true, nil
+		return nil
 	}
-	return false, nil
+
+	for {
+		obj := iter.Next()
+		if obj != nil {
+			batch = append(batch, obj)
+		}
+
+		if obj == nil || len(batch) == deleteBatchSize {
+			if err := flush(); err != nil {
+				return deleted, err
+			}
+			if obj == nil {
+				break
+			}
+			// All entries were nilled by flush; reuse the bounded backing
+			// array for the next batch without retaining deleted objects.
+			batch = batch[:0]
+		}
+	}
+
+	return deleted, nil
 }
 
 // DeleteAll is used to delete all the objects in a given table
-// matching the constraints on the index
+// matching the constraints on the index. It returns the number of distinct
+// objects deleted.
 func (txn *Txn) DeleteAll(table, index string, args ...interface{}) (int, error) {
 	if !txn.write {
 		return 0, fmt.Errorf("cannot delete in read-only transaction")
 	}
 
-	// Get all the objects
+	// Get all the objects. The iterator itself is a snapshot; buffer only a
+	// bounded batch instead of materializing the complete result set.
 	iter, err := txn.Get(table, index, args...)
 	if err != nil {
 		return 0, err
 	}
 
-	// Put them into a slice so there are no safety concerns while actually
-	// performing the deletes
-	var objs []interface{}
-	for {
-		obj := iter.Next()
-		if obj == nil {
-			break
-		}
-
-		objs = append(objs, obj)
-	}
-
-	// Do the deletes
-	num := 0
-	for _, obj := range objs {
-		if err := txn.Delete(table, obj); err != nil {
-			return num, err
-		}
-		num++
-	}
-	return num, nil
+	return txn.deleteFromResultIterator(table, iter)
 }
 
 // FirstWatch is used to return the first matching object for
@@ -742,9 +771,19 @@ type ResultIterator interface {
 // See the documentation for ResultIterator to understand the behaviour of the
 // returned ResultIterator.
 func (txn *Txn) Get(table, index string, args ...interface{}) (ResultIterator, error) {
+	iter, _, err := txn.getResultIteratorWithValue(table, index, args...)
+	return iter, err
+}
+
+// getResultIteratorWithValue is Get plus the encoded index/prefix value used
+// to seek the underlying radix iterator.
+func (txn *Txn) getResultIteratorWithValue(
+	table, index string,
+	args ...interface{},
+) (ResultIterator, []byte, error) {
 	indexIter, val, err := txn.getIndexIterator(table, index, args...)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Seek the iterator to the appropriate sub-set
@@ -755,7 +794,7 @@ func (txn *Txn) Get(table, index string, args ...interface{}) (ResultIterator, e
 		iter:    indexIter,
 		watchCh: watchCh,
 	}
-	return iter, nil
+	return iter, val, nil
 }
 
 // GetReverse is used to construct a Reverse ResultIterator over all the

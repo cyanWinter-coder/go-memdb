@@ -993,8 +993,17 @@ func TestTxn_DeletePrefix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected err: %v", err)
 	}
-	if !deleted {
-		t.Fatalf("Expected DeletePrefix to return true")
+	if deleted != 3 {
+		t.Fatalf("Expected DeletePrefix to delete 3 objects, got %d", deleted)
+	}
+
+	// Repeating the deletion is stable and reports no additional objects.
+	deleted, err = txn.DeletePrefix("main", "id_prefix", "my-")
+	if err != nil {
+		t.Fatalf("Unexpected err on repeated DeletePrefix: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("Expected repeated DeletePrefix to delete 0 objects, got %d", deleted)
 	}
 
 	// Ensure we cannot lookup by id field index
