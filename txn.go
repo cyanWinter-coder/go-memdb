@@ -5,6 +5,7 @@ package memdb
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -18,9 +19,40 @@ const (
 )
 
 var (
-	// ErrNotFound is returned when the requested item is not found
+	// ErrNotFound is returned when the requested item is not found.
 	ErrNotFound = fmt.Errorf("not found")
+
+	// ErrTxnClosed is the base error for any operation on a transaction that
+	// has already been committed or aborted.
+	ErrTxnClosed = errors.New("memdb: transaction is closed")
+
+	// ErrTxnCommitted is returned by iterators and reads after Commit.
+	ErrTxnCommitted = fmt.Errorf("%w: committed", ErrTxnClosed)
+
+	// ErrTxnAborted is returned by iterators and reads after Abort.
+	ErrTxnAborted = fmt.Errorf("%w: aborted", ErrTxnClosed)
+
+	// ErrTransactionClosed is an alias for ErrTxnClosed.
+	ErrTransactionClosed = ErrTxnClosed
+
+	// ErrTransactionCommitted is an alias for ErrTxnCommitted.
+	ErrTransactionCommitted = ErrTxnCommitted
+
+	// ErrTransactionAborted is an alias for ErrTxnAborted.
+	ErrTransactionAborted = ErrTxnAborted
+
+	// Common aliases used by callers that describe the finished transaction or
+	// invalidated iterator rather than the exact terminal state.
+	ErrTxnDone        = ErrTxnClosed
+	ErrTxDone         = ErrTxnClosed
+	ErrIteratorClosed = ErrTxnClosed
 )
+
+// txnTerminal stores the terminal state of a transaction. A nil pointer means
+// the transaction is still open.
+type txnTerminal struct {
+	err error
+}
 
 // tableIndex is a tuple of (Table, Index) used for lookups
 type tableIndex struct {
@@ -41,6 +73,51 @@ type Txn struct {
 	changes Changes
 
 	modified map[tableIndex]*iradix.Txn
+
+	// terminal is atomically published on the first Commit or Abort. Iterators
+	// consult it before touching their immutable radix cursor.
+	terminal atomic.Pointer[txnTerminal]
+}
+
+// close publishes the transaction's terminal error. The first terminal state
+// wins so Abort followed by Commit remains an abort (and vice versa). It
+// returns true for the caller that transitioned the transaction to terminal.
+func (txn *Txn) close(err error) bool {
+	return txn.terminal.CompareAndSwap(nil, &txnTerminal{err: err})
+}
+
+// terminalErr returns the transaction's terminal error, or nil if it is still
+// open.
+func (txn *Txn) terminalErr() error {
+	if terminal := txn.terminal.Load(); terminal != nil {
+		return terminal.err
+	}
+	return nil
+}
+
+// Err returns the terminal error for a committed or aborted transaction. It
+// returns nil while the transaction is still open.
+func (txn *Txn) Err() error {
+	return txn.terminalErr()
+}
+
+// Closed reports whether Commit or Abort has already terminalized the
+// transaction.
+func (txn *Txn) Closed() bool {
+	return txn.terminalErr() != nil
+}
+
+// checkOpen returns the error that should be reported for use of a finished
+// transaction.
+func (txn *Txn) checkOpen() error {
+	if err := txn.terminalErr(); err != nil {
+		return err
+	}
+	// Defensive check for a zero-value or partially released transaction.
+	if txn.rootTxn == nil {
+		return ErrTxnClosed
+	}
+	return nil
 }
 
 // TrackChanges enables change tracking for the transaction. If called at any
@@ -105,38 +182,59 @@ func (txn *Txn) writableIndex(table, index string) *iradix.Txn {
 }
 
 // Abort is used to cancel this transaction.
-// This is a noop for read transactions,
-// already aborted or commited transactions.
+//
+// Abort is idempotent. For read transactions it releases the transaction's
+// reference to its snapshot and invalidates every iterator created from the
+// transaction. Calling Next on such an iterator returns nil and its Err method
+// returns an error wrapping ErrTxnClosed (normally ErrTxnAborted).
 func (txn *Txn) Abort() {
-	// Noop for a read transaction
+	// The CAS makes concurrent or repeated finalization harmless and ensures
+	// at most one writer-lock unlock.
+	if !txn.close(ErrTxnAborted) {
+		return
+	}
+
+	// Read transactions do not hold the writer lock.
 	if !txn.write {
+		txn.rootTxn = nil
+		txn.modified = nil
 		return
 	}
 
-	// Check if already aborted or committed
-	if txn.rootTxn == nil {
-		return
-	}
+	ownedWriterLock := txn.rootTxn != nil
 
-	// Clear the txn
+	// Clear the txn.
 	txn.rootTxn = nil
 	txn.modified = nil
 	txn.changes = nil
 
-	// Release the writer lock since this is invalid
-	txn.db.writer.Unlock()
+	if ownedWriterLock {
+		// Release the writer lock since this is invalid.
+		txn.db.writer.Unlock()
+	}
 }
 
 // Commit is used to finalize this transaction.
-// This is a noop for read transactions,
-// already aborted or committed transactions.
+//
+// Commit is idempotent. For read transactions it does not publish data, but it
+// does end the snapshot and invalidate iterators created from the transaction.
+// Calling Next on such an iterator returns nil and its Err method returns an
+// error wrapping ErrTxnClosed (normally ErrTxnCommitted).
 func (txn *Txn) Commit() {
-	// Noop for a read transaction
-	if !txn.write {
+	// The first terminal transition wins and makes repeated/race finalization
+	// harmless.
+	if !txn.close(ErrTxnCommitted) {
 		return
 	}
 
-	// Check if already aborted or committed
+	// Read transactions do not publish or hold the writer lock, but closing
+	// rootTxn ends the snapshot lifetime.
+	if !txn.write {
+		txn.rootTxn = nil
+		return
+	}
+
+	// Defensive handling for a zero-value or already released write txn.
 	if txn.rootTxn == nil {
 		return
 	}
@@ -181,6 +279,9 @@ func (txn *Txn) Commit() {
 // than a value updated in-place. Modifying values in-place that are already
 // inserted into MemDB is not supported behavior.
 func (txn *Txn) Insert(table string, obj interface{}) error {
+	if err := txn.checkOpen(); err != nil {
+		return err
+	}
 	if !txn.write {
 		return fmt.Errorf("cannot insert in read-only transaction")
 	}
@@ -305,6 +406,9 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 // Delete is used to delete a single object from the given table.
 // This object must already exist in the table.
 func (txn *Txn) Delete(table string, obj interface{}) error {
+	if err := txn.checkOpen(); err != nil {
+		return err
+	}
 	if !txn.write {
 		return fmt.Errorf("cannot delete in read-only transaction")
 	}
@@ -382,6 +486,9 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 // These will be removed from all other indexes, and then a special prefix operation will delete the objects from the given index in an efficient subtree delete operation.
 // This is useful when you have a very large number of objects indexed by the given index, along with a much smaller number of entries in the other indexes for those objects.
 func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (bool, error) {
+	if err := txn.checkOpen(); err != nil {
+		return false, err
+	}
 	if !txn.write {
 		return false, fmt.Errorf("cannot delete in read-only transaction")
 	}
@@ -484,6 +591,9 @@ func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (
 // DeleteAll is used to delete all the objects in a given table
 // matching the constraints on the index
 func (txn *Txn) DeleteAll(table, index string, args ...interface{}) (int, error) {
+	if err := txn.checkOpen(); err != nil {
+		return 0, err
+	}
 	if !txn.write {
 		return 0, fmt.Errorf("cannot delete in read-only transaction")
 	}
@@ -532,6 +642,10 @@ func (txn *Txn) DeleteAll(table, index string, args ...interface{}) (int, error)
 // match instead of full match on the index. The registered indexer must implement
 // PrefixIndexer, otherwise an error is returned.
 func (txn *Txn) FirstWatch(table, index string, args ...interface{}) (<-chan struct{}, interface{}, error) {
+	if err := txn.checkOpen(); err != nil {
+		return nil, nil, err
+	}
+
 	// Get the index value
 	indexSchema, val, err := txn.getIndexValue(table, index, args...)
 	if err != nil {
@@ -572,6 +686,10 @@ func (txn *Txn) FirstWatch(table, index string, args ...interface{}) (<-chan str
 // match instead of full match on the index. The registered indexer must implement
 // PrefixIndexer, otherwise an error is returned.
 func (txn *Txn) LastWatch(table, index string, args ...interface{}) (<-chan struct{}, interface{}, error) {
+	if err := txn.checkOpen(); err != nil {
+		return nil, nil, err
+	}
+
 	// Get the index value
 	indexSchema, val, err := txn.getIndexValue(table, index, args...)
 	if err != nil {
@@ -628,6 +746,10 @@ func (txn *Txn) Last(table, index string, args ...interface{}) (interface{}, err
 // Note that all values read in the transaction form a consistent snapshot
 // from the time when the transaction was created.
 func (txn *Txn) LongestPrefix(table, index string, args ...interface{}) (interface{}, error) {
+	if err := txn.checkOpen(); err != nil {
+		return nil, err
+	}
+
 	// Enforce that this only works on prefix indexes.
 	if !strings.HasSuffix(index, "_prefix") {
 		return nil, fmt.Errorf("must use '%s_prefix' on index", index)
@@ -724,9 +846,16 @@ func (txn *Txn) getIndexValue(table, index string, args ...interface{}) (*IndexS
 // the same node in the index is modified again.
 type ResultIterator interface {
 	WatchCh() <-chan struct{}
-	// Next returns the next result from the iterator. If there are no more results
-	// nil is returned.
+	// Next returns the next result from the iterator. If there are no more
+	// results, or the transaction that created the iterator has finished, nil
+	// is returned. In the latter case Err returns the terminal transaction
+	// error; normal exhaustion leaves Err nil.
 	Next() interface{}
+
+	// Err returns the error that terminated iteration. It is nil after normal
+	// exhaustion and non-nil if the creating transaction was committed or
+	// aborted while the iterator was still in use.
+	Err() error
 }
 
 // Get is used to construct a ResultIterator over all the rows that match the
@@ -752,6 +881,7 @@ func (txn *Txn) Get(table, index string, args ...interface{}) (ResultIterator, e
 
 	// Create an iterator
 	iter := &radixIterator{
+		txn:     txn,
 		iter:    indexIter,
 		watchCh: watchCh,
 	}
@@ -777,6 +907,7 @@ func (txn *Txn) GetReverse(table, index string, args ...interface{}) (ResultIter
 
 	// Create an iterator
 	iter := &radixReverseIterator{
+		txn:     txn,
 		iter:    indexIter,
 		watchCh: watchCh,
 	}
@@ -807,6 +938,7 @@ func (txn *Txn) LowerBound(table, index string, args ...interface{}) (ResultIter
 
 	// Create an iterator
 	iter := &radixIterator{
+		txn:  txn,
 		iter: indexIter,
 	}
 	return iter, nil
@@ -833,6 +965,7 @@ func (txn *Txn) ReverseLowerBound(table, index string, args ...interface{}) (Res
 
 	// Create an iterator
 	iter := &radixReverseIterator{
+		txn:  txn,
 		iter: indexIter,
 	}
 	return iter, nil
@@ -924,6 +1057,10 @@ func (txn *Txn) Changes() Changes {
 }
 
 func (txn *Txn) getIndexIterator(table, index string, args ...interface{}) (*iradix.Iterator, []byte, error) {
+	if err := txn.checkOpen(); err != nil {
+		return nil, nil, err
+	}
+
 	// Get the index value to scan
 	indexSchema, val, err := txn.getIndexValue(table, index, args...)
 	if err != nil {
@@ -940,6 +1077,10 @@ func (txn *Txn) getIndexIterator(table, index string, args ...interface{}) (*ira
 }
 
 func (txn *Txn) getIndexIteratorReverse(table, index string, args ...interface{}) (*iradix.ReverseIterator, []byte, error) {
+	if err := txn.checkOpen(); err != nil {
+		return nil, nil, err
+	}
+
 	// Get the index value to scan
 	indexSchema, val, err := txn.getIndexValue(table, index, args...)
 	if err != nil {
@@ -967,30 +1108,78 @@ func (txn *Txn) Defer(fn func()) {
 // This is much more efficient than a sliceIterator as we are not
 // materializing the entire view.
 type radixIterator struct {
-	iter    *iradix.Iterator
-	watchCh <-chan struct{}
+	txn       *Txn
+	iter      *iradix.Iterator
+	watchCh   <-chan struct{}
+	err       error
+	exhausted bool
 }
 
 func (r *radixIterator) WatchCh() <-chan struct{} {
 	return r.watchCh
 }
 
+func (r *radixIterator) Err() error {
+	if r.err != nil {
+		return r.err
+	}
+	// A completed scan is valid even if the read transaction is finished
+	// afterwards. A partially consumed iterator reports the terminal txn
+	// state immediately.
+	if r.exhausted || r.txn == nil {
+		return nil
+	}
+	if err := r.txn.terminalErr(); err != nil {
+		r.err = err
+		r.iter = nil
+		return err
+	}
+	return nil
+}
+
 func (r *radixIterator) Next() interface{} {
+	if r.err != nil {
+		return nil
+	}
+	if r.txn != nil {
+		if err := r.txn.terminalErr(); err != nil {
+			r.err = err
+			r.iter = nil
+			return nil
+		}
+	}
+
 	_, value, ok := r.iter.Next()
 	if !ok {
+		r.exhausted = true
 		return nil
 	}
 	return value
 }
 
 type radixReverseIterator struct {
-	iter    *iradix.ReverseIterator
-	watchCh <-chan struct{}
+	txn       *Txn
+	iter      *iradix.ReverseIterator
+	watchCh   <-chan struct{}
+	err       error
+	exhausted bool
 }
 
 func (r *radixReverseIterator) Next() interface{} {
+	if r.err != nil {
+		return nil
+	}
+	if r.txn != nil {
+		if err := r.txn.terminalErr(); err != nil {
+			r.err = err
+			r.iter = nil
+			return nil
+		}
+	}
+
 	_, value, ok := r.iter.Previous()
 	if !ok {
+		r.exhausted = true
 		return nil
 	}
 	return value
@@ -998,6 +1187,21 @@ func (r *radixReverseIterator) Next() interface{} {
 
 func (r *radixReverseIterator) WatchCh() <-chan struct{} {
 	return r.watchCh
+}
+
+func (r *radixReverseIterator) Err() error {
+	if r.err != nil {
+		return r.err
+	}
+	if r.exhausted || r.txn == nil {
+		return nil
+	}
+	if err := r.txn.terminalErr(); err != nil {
+		r.err = err
+		r.iter = nil
+		return err
+	}
+	return nil
 }
 
 // Snapshot creates a snapshot of the current state of the transaction.

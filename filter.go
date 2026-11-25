@@ -39,3 +39,8 @@ func (f *FilterIterator) Next() interface{} {
 		}
 	}
 }
+
+// Err returns the terminal error of the wrapped iterator, if any.
+func (f *FilterIterator) Err() error {
+	return f.iter.Err()
+}
