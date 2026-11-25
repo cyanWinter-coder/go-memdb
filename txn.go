@@ -22,6 +22,23 @@ var (
 	ErrNotFound = fmt.Errorf("not found")
 )
 
+// UniqueIndexError is returned by Insert when the object being inserted
+// would violate the uniqueness constraint of an index. It carries the
+// table, the index and the conflicting key (as well as the object that
+// currently holds the key) so that callers can identify the conflict
+// programmatically, for example via errors.As.
+type UniqueIndexError struct {
+	Table string
+	Index string
+	Key   []byte
+	Value interface{}
+}
+
+func (e *UniqueIndexError) Error() string {
+	return fmt.Sprintf("object would violate unique index '%s' of table '%s' with key %q",
+		e.Index, e.Table, e.Key)
+}
+
 // tableIndex is a tuple of (Table, Index) used for lookups
 type tableIndex struct {
 	Table string
@@ -206,12 +223,24 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 	idTxn := txn.writableIndex(table, id)
 	existing, update := idTxn.Get(idVal)
 
+	// indexMutation holds the pending delete/insert operations computed
+	// for a single index of the table.
+	type indexMutation struct {
+		name    string
+		deletes [][]byte
+		inserts [][]byte
+	}
+
 	// On an update, there is an existing object with the given
 	// primary ID. We do the update by deleting the current object
 	// and inserting the new object.
+	//
+	// All index entries are computed and validated (including the unique
+	// constraints) before any of them is applied, so that a failure part
+	// way through cannot leave the transaction with a partially indexed
+	// object and the transaction remains usable.
+	mutations := make([]indexMutation, 0, len(tableSchema.Indexes))
 	for name, indexSchema := range tableSchema.Indexes {
-		indexTxn := txn.writableIndex(table, name)
-
 		// Determine the new index value
 		var (
 			ok   bool
@@ -230,14 +259,23 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 			return fmt.Errorf("failed to build index '%s': %v", name, err)
 		}
 
-		// Handle non-unique index by computing a unique index.
-		// This is done by appending the primary key which must
-		// be unique anyways.
-		if ok && !indexSchema.Unique {
+		// If there is no index value, either this is an error or an expected
+		// case and we can skip updating
+		if !ok {
+			if !indexSchema.AllowMissing {
+				return fmt.Errorf("missing value for index '%s'", name)
+			}
+			vals = nil
+		} else if !indexSchema.Unique {
+			// Handle non-unique index by computing a unique index.
+			// This is done by appending the primary key which must
+			// be unique anyways.
 			for i := range vals {
 				vals[i] = append(vals[i], idVal...)
 			}
 		}
+
+		mutation := indexMutation{name: name, inserts: vals}
 
 		// Handle the update by deleting from the index first
 		if update {
@@ -270,24 +308,53 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 					// we can avoid the delete as the insert will overwrite the
 					// value anyways.
 					if i >= len(vals) || !bytes.Equal(valExist, vals[i]) {
-						indexTxn.Delete(valExist)
+						mutation.deletes = append(mutation.deletes, valExist)
 					}
 				}
 			}
 		}
 
-		// If there is no index value, either this is an error or an expected
-		// case and we can skip updating
-		if !ok {
-			if indexSchema.AllowMissing {
-				continue
-			} else {
-				return fmt.Errorf("missing value for index '%s'", name)
+		// Enforce the uniqueness constraint of unique indexes. This is
+		// checked before any mutation is applied so that a conflict leaves
+		// the transaction untouched.
+		if ok && indexSchema.Unique {
+			indexTxn := txn.writableIndex(table, name)
+			for _, val := range vals {
+				conflict, found := indexTxn.Get(val)
+				if !found {
+					continue
+				}
+				// On an update, the entry we find may belong to the object
+				// being replaced, which is not a conflict.
+				if update {
+					_, conflictID, err := idIndexer.FromObject(conflict)
+					if err == nil && bytes.Equal(conflictID, idVal) {
+						continue
+					}
+				}
+				return &UniqueIndexError{
+					Table: table,
+					Index: name,
+					Key:   val,
+					Value: conflict,
+				}
 			}
 		}
 
-		// Update the value of the index
-		for _, val := range vals {
+		mutations = append(mutations, mutation)
+	}
+
+	// Apply all the mutations. None of these operations can fail, so the
+	// object is always indexed either fully or not at all.
+	for _, mutation := range mutations {
+		if len(mutation.deletes) == 0 && len(mutation.inserts) == 0 {
+			continue
+		}
+		indexTxn := txn.writableIndex(table, mutation.name)
+		for _, val := range mutation.deletes {
+			indexTxn.Delete(val)
+		}
+		for _, val := range mutation.inserts {
 			indexTxn.Insert(val, obj)
 		}
 	}

@@ -273,7 +273,7 @@ func TestComplexDB(t *testing.T) {
 		t.Fatalf("bad place: %v", place)
 	}
 
-	raw, err = txn.First("places", "name_tags_name_meta", "HashiCorp", "North America", "HashiCorp", "Piers", "Pretty Salty")
+	raw, err = txn.First("places", "name_tags_name_meta", "HashiCorp Pier", "North America", "HashiCorp Pier", "Piers", "Pretty Salty")
 	noErr(t, err)
 	if raw == nil {
 		t.Fatalf("should get place")
@@ -382,6 +382,7 @@ func testPopulateData(t *testing.T, db *MemDB) {
 	place2 := testPlace()
 	place2.Name = "Maui"
 	place3 := testPlace()
+	place3.Name = "HashiCorp Pier"
 	place3.Tags = []string{"North America", "Earth"}
 	place3.Meta = map[string]string{"Piers": "Pretty Salty"}
 
