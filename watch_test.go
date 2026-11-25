@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"runtime"
 	"runtime/pprof"
 	"strings"
 	"testing"
@@ -243,6 +244,73 @@ func TestWatch_AddWithLimit(t *testing.T) {
 		if !didTimeout {
 			t.Fatalf("bad")
 		}
+	}
+}
+
+// TestWatchCtxTriggerPreferredOverCancel verifies that when the context is
+// done at the same time as a watch channel triggers, the trigger is reported
+// instead of the cancellation, across both the watchFew and watchMany paths.
+func TestWatchCtxTriggerPreferredOverCancel(t *testing.T) {
+	for _, size := range []int{1, aFew, aFew + 1, 3 * aFew} {
+		ws := NewWatchSet()
+		fireCh := make(chan struct{})
+		ws.Add(fireCh)
+		for i := 1; i < size; i++ {
+			ws.Add(make(chan struct{}))
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		close(fireCh)
+		cancel()
+
+		if err := ws.WatchCtx(ctx); err != nil {
+			t.Fatalf("size %d: expected trigger to win over cancel, got: %v", size, err)
+		}
+	}
+}
+
+// TestWatchCtxNilContext verifies that a nil context is treated like
+// context.Background() and doesn't panic.
+func TestWatchCtxNilContext(t *testing.T) {
+	ws := NewWatchSet()
+	fireCh := make(chan struct{})
+	ws.Add(fireCh)
+	close(fireCh)
+
+	if err := ws.WatchCtx(nil); err != nil {
+		t.Fatalf("expected no err got: %v", err)
+	}
+}
+
+// TestWatchCtxManyBoundedGoroutines verifies that waiting on a large watch
+// set doesn't spawn a goroutine per chunk of channels.
+func TestWatchCtxManyBoundedGoroutines(t *testing.T) {
+	ws := NewWatchSet()
+	fireCh := make(chan struct{})
+	ws.Add(fireCh)
+	for i := 0; i < 10000; i++ {
+		ws.Add(make(chan struct{}))
+	}
+
+	before := runtime.NumGoroutine()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- ws.WatchCtx(ctx)
+	}()
+
+	// Let the watch settle, then check the wait isn't holding a goroutine
+	// per chunk of channels (the old implementation would hold ~300 here).
+	time.Sleep(100 * time.Millisecond)
+	if got := runtime.NumGoroutine(); got > before+10 {
+		t.Fatalf("too many goroutines: before=%d during=%d", before, got)
+	}
+
+	close(fireCh)
+	if err := <-done; err != nil {
+		t.Fatalf("expected no err got: %v", err)
 	}
 }
 

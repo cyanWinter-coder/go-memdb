@@ -5,6 +5,7 @@ package memdb
 
 import (
 	"context"
+	"reflect"
 	"time"
 )
 
@@ -58,13 +59,16 @@ func (w WatchSet) Watch(timeoutCh <-chan time.Time) bool {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() {
-		select {
-		case <-timeoutCh:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
+	// Avoid spawning a goroutine at all if there is no timeout channel.
+	if timeoutCh != nil {
+		go func() {
+			select {
+			case <-timeoutCh:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
 
 	return w.WatchCtx(ctx) == context.Canceled
 }
@@ -73,12 +77,23 @@ func (w WatchSet) Watch(timeoutCh <-chan time.Time) bool {
 // ctx is done (cancelled or exceeds the deadline). WatchCtx returns an error
 // if the ctx causes it to unblock, otherwise returns nil.
 //
+// A nil ctx is treated as context.Background(), so WatchCtx blocks until one
+// of the channels triggers.
+//
+// If the context is done at the same time as one of the channels triggers,
+// the trigger is preferred and nil is returned, so a change that has already
+// happened is never reported as a cancellation.
+//
 // WatchCtx should be preferred over Watch.
 func (w WatchSet) WatchCtx(ctx context.Context) error {
 	if w == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
+	var err error
 	if n := len(w); n <= aFew {
 		idx := 0
 		chunk := make([]<-chan struct{}, aFew)
@@ -86,57 +101,51 @@ func (w WatchSet) WatchCtx(ctx context.Context) error {
 			chunk[idx] = watchCh
 			idx++
 		}
-		return watchFew(ctx, chunk)
+		err = watchFew(ctx, chunk)
+	} else {
+		err = w.watchMany(ctx)
+	}
+	if err == nil {
+		return nil
 	}
 
-	return w.watchMany(ctx)
+	// The context won the race, but a watch channel may have triggered at
+	// the same time. Prefer reporting the trigger so that a change that has
+	// already happened is not lost.
+	for watchCh := range w {
+		select {
+		case <-watchCh:
+			return nil
+		default:
+		}
+	}
+	return err
 }
 
-// watchMany is used if there are many watchers.
+// watchMany is used if there are many watchers. It performs a single
+// reflect.Select over all the channels in the calling goroutine instead of
+// spawning a goroutine per chunk of channels, so the number of goroutines a
+// wait holds is bounded (zero extra) no matter how large the watch set is.
+// All references to the channels and the context are released on return.
 func (w WatchSet) watchMany(ctx context.Context) error {
-	// Cancel all watcher goroutines when return.
-	watcherCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// Set up a goroutine for each watcher.
-	triggerCh := make(chan struct{}, 1)
-	watcher := func(chunk []<-chan struct{}) {
-		if err := watchFew(watcherCtx, chunk); err == nil {
-			select {
-			case triggerCh <- struct{}{}:
-			default:
-			}
-		}
-	}
-
-	// Apportion the watch channels into chunks we can feed into the
-	// watchFew helper.
-	idx := 0
-	chunk := make([]<-chan struct{}, aFew)
+	cases := make([]reflect.SelectCase, 0, len(w)+1)
+	cases = append(cases, reflect.SelectCase{
+		Dir:  reflect.SelectRecv,
+		Chan: reflect.ValueOf(ctx.Done()),
+	})
 	for watchCh := range w {
-		subIdx := idx % aFew
-		chunk[subIdx] = watchCh
-		idx++
-
-		// Fire off this chunk and start a fresh one.
-		if idx%aFew == 0 {
-			go watcher(chunk)
-			chunk = make([]<-chan struct{}, aFew)
-		}
+		// A nil channel is never ready, matching select semantics.
+		cases = append(cases, reflect.SelectCase{
+			Dir:  reflect.SelectRecv,
+			Chan: reflect.ValueOf(watchCh),
+		})
 	}
 
-	// Make sure to watch any residual channels in the last chunk.
-	if idx%aFew != 0 {
-		go watcher(chunk)
-	}
-
-	// Wait for a channel to trigger or timeout.
-	select {
-	case <-triggerCh:
-		return nil
-	case <-ctx.Done():
+	chosen, _, _ := reflect.Select(cases)
+	if chosen == 0 {
 		return ctx.Err()
 	}
+	return nil
 }
 
 // WatchCh returns a channel that is used to wait for any channel of the watch set to trigger
