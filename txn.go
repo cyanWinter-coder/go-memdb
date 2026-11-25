@@ -7,8 +7,6 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
-	"sync/atomic"
-	"unsafe"
 
 	iradix "github.com/hashicorp/go-immutable-radix"
 )
@@ -37,8 +35,14 @@ type Txn struct {
 	after   []func()
 
 	// changes is used to track the changes performed during the transaction. If
-	// it is nil at transaction start then changes are not tracked.
+	// it is nil at transaction start then changes are not tracked through the
+	// public Changes API.
 	changes Changes
+
+	// recorded captures the complete mutation set for ordered commit events,
+	// independently of whether the caller invoked TrackChanges. It is nil
+	// only after abort/commit cleanup.
+	recorded Changes
 
 	modified map[tableIndex]*iradix.Txn
 }
@@ -53,6 +57,18 @@ func (txn *Txn) TrackChanges() {
 	if txn.changes == nil {
 		txn.changes = make(Changes, 0, 1)
 	}
+}
+
+// recordChange appends a mutation to both the opt-in Changes stream and the
+// always-on commit-event log.
+func (txn *Txn) recordChange(change Change) {
+	if txn.changes != nil {
+		txn.changes = append(txn.changes, change)
+	}
+	if txn.recorded == nil {
+		txn.recorded = make(Changes, 0, 1)
+	}
+	txn.recorded = append(txn.recorded, change)
 }
 
 // readableIndex returns a transaction usable for reading the given index in a
@@ -122,6 +138,7 @@ func (txn *Txn) Abort() {
 	txn.rootTxn = nil
 	txn.modified = nil
 	txn.changes = nil
+	txn.recorded = nil
 
 	// Release the writer lock since this is invalid
 	txn.db.writer.Unlock()
@@ -148,9 +165,44 @@ func (txn *Txn) Commit() {
 		txn.rootTxn.Insert(path, final)
 	}
 
-	// Update the root of the DB
+	// Preserve the existing Changes() caching/deduplication behavior for
+	// callers that explicitly enabled tracking. The commit event uses the
+	// independently recorded complete mutation log.
+	if txn.changes != nil {
+		_ = txn.Changes()
+	}
+	publishedChanges := dedupeChanges(txn.recorded)
+
+	// Build the next committed view. Position/generation N is published only
+	// after the transaction has successfully committed.
+	prev := txn.db.getView()
+	position := prev.generation + 1
 	newRoot := txn.rootTxn.CommitOnly()
-	atomic.StorePointer(&txn.db.root, unsafe.Pointer(newRoot))
+	newView := &commitView{
+		generation: position,
+		root:       newRoot,
+		changes:    publishedChanges,
+	}
+	event := CommitEvent{
+		Position:   position,
+		Generation: position,
+		Sequence:   position,
+		Offset:     position,
+		Index:      position,
+		Revision:   position,
+		Version:    position,
+		Changes:    publishedChanges,
+	}
+
+	// Keep the historical root field synchronized for internals/tests that
+	// still load it directly; commitView is the coherent publication unit.
+	txn.db.setRoot(newRoot)
+
+	// Publish the view and ordered event atomically with respect to
+	// subscription/replay registration. Publish performs non-blocking
+	// fan-out and never waits for a slow subscriber.
+	txn.db.subs.publish(txn.db, newView, event)
+	txn.recorded = nil
 
 	// Now issue all of the mutation updates (this is safe to call
 	// even if mutation tracking isn't enabled); we do this after
@@ -291,14 +343,12 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 			indexTxn.Insert(val, obj)
 		}
 	}
-	if txn.changes != nil {
-		txn.changes = append(txn.changes, Change{
-			Table:      table,
-			Before:     existing, // might be nil on a create
-			After:      obj,
-			primaryKey: idVal,
-		})
-	}
+	txn.recordChange(Change{
+		Table:      table,
+		Before:     existing, // might be nil on a create
+		After:      obj,
+		primaryKey: idVal,
+	})
 	return nil
 }
 
@@ -366,14 +416,12 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 			}
 		}
 	}
-	if txn.changes != nil {
-		txn.changes = append(txn.changes, Change{
-			Table:      table,
-			Before:     existing,
-			After:      nil, // Now nil indicates deletion
-			primaryKey: idVal,
-		})
-	}
+	txn.recordChange(Change{
+		Table:      table,
+		Before:     existing,
+		After:      nil, // Now nil indicates deletion
+		primaryKey: idVal,
+	})
 	return nil
 }
 
@@ -418,18 +466,17 @@ func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (
 		if !ok {
 			return false, fmt.Errorf("object missing primary index")
 		}
-		if txn.changes != nil {
-			// Record the deletion
-			idTxn := txn.writableIndex(table, id)
-			existing, ok := idTxn.Get(idVal)
-			if ok {
-				txn.changes = append(txn.changes, Change{
-					Table:      table,
-					Before:     existing,
-					After:      nil, // Now nil indicates deletion
-					primaryKey: idVal,
-				})
-			}
+		// Record the deletion for both the opt-in Changes API and the
+		// ordered commit-event log.
+		idTxn := txn.writableIndex(table, id)
+		existing, ok := idTxn.Get(idVal)
+		if ok {
+			txn.recordChange(Change{
+				Table:      table,
+				Before:     existing,
+				After:      nil, // Now nil indicates deletion
+				primaryKey: idVal,
+			})
 		}
 		// Remove the object from all the indexes except the given prefix index
 		for name, indexSchema := range tableSchema.Indexes {
@@ -870,11 +917,22 @@ func (txn *Txn) Changes() Changes {
 	if txn.changes == nil {
 		return nil
 	}
+	txn.changes = dedupeChanges(txn.changes)
+	return txn.changes
+}
+
+// dedupeChanges collapses multiple mutations to the same primary object into
+// one net change. The first Before value is retained and the change takes its
+// order from the last mutation to that object.
+func dedupeChanges(in Changes) Changes {
+	if in == nil {
+		return nil
+	}
 
 	// De-duplicate mutations by key so all take effect at the point of the last
 	// write but we keep the mutations in order.
 	dups := make(map[objectID]mutInfo)
-	for i, m := range txn.changes {
+	for i, m := range in {
 		oid := objectID{
 			Table:    m.Table,
 			IndexVal: string(m.primaryKey),
@@ -888,14 +946,14 @@ func (txn *Txn) Changes() Changes {
 		mi.lastIdx = i
 		dups[oid] = mi
 	}
-	if len(dups) == len(txn.changes) {
+	if len(dups) == len(in) {
 		// No duplicates found, fast path return it as is
-		return txn.changes
+		return in
 	}
 
 	// Need to remove the duplicates
 	cs := make(Changes, 0, len(dups))
-	for i, m := range txn.changes {
+	for i, m := range in {
 		oid := objectID{
 			Table:    m.Table,
 			IndexVal: string(m.primaryKey),
@@ -918,8 +976,6 @@ func (txn *Txn) Changes() Changes {
 			cs = append(cs, m)
 		}
 	}
-	// Store the de-duped version in case this is called again
-	txn.changes = cs
 	return cs
 }
 
